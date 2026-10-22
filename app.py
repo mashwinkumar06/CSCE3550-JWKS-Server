@@ -1,109 +1,105 @@
+"""SQLite-backed JWKS server for CSCE 3550 Project 2."""
 import base64
+import os
+import sqlite3
 import time
-import uuid
 
 import jwt
-from flask import Flask, jsonify, request
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+app.config['DATABASE'] = os.environ.get('JWKS_DB_PATH', 'totally_not_my_privateKeys.db')
 
 
-# Makes a new RSA key
-def make_key(expired=False):
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048
+def connect_db():
+    return sqlite3.connect(app.config['DATABASE'])
+
+
+def generate_key(exp):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
     )
-
-    # Give every key its own ID
-    kid = str(uuid.uuid4())
-
-    # One key will already be expired
-    if expired:
-        expires = int(time.time()) - 3600
-    else:
-        expires = int(time.time()) + 3600
-
-    return {
-        "private_key": private_key,
-        "kid": kid,
-        "expires": expires
-    }
+    with connect_db() as connection:
+        cursor = connection.execute(
+            'INSERT INTO keys (key, exp) VALUES (?, ?)', (pem, exp)
+        )
+        return cursor.lastrowid
 
 
-# We need one normal key and one expired key
-normal_key = make_key()
-old_key = make_key(expired=True)
+def initialize_db():
+    with connect_db() as connection:
+        connection.execute('''CREATE TABLE IF NOT EXISTS keys (
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+        )''')
+        now = int(time.time())
+        valid = connection.execute('SELECT COUNT(*) FROM keys WHERE exp > ?', (now,)).fetchone()[0]
+        expired = connection.execute('SELECT COUNT(*) FROM keys WHERE exp <= ?', (now,)).fetchone()[0]
+    if not valid:
+        generate_key(now + 7200)
+    if not expired:
+        generate_key(now - 3600)
 
 
-# Converts a number to the format needed by JWK
+def read_key(expired=False):
+    now = int(time.time())
+    operator = '<=' if expired else '>'
+    ordering = 'DESC' if expired else 'DESC'
+    with connect_db() as connection:
+        row = connection.execute(
+            f'SELECT kid, key, exp FROM keys WHERE exp {operator} ? ORDER BY exp {ordering} LIMIT 1',
+            (now,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {'kid': str(row[0]), 'private_key': serialization.load_pem_private_key(row[1], password=None), 'exp': row[2]}
+
+
 def to_base64(number):
-    size = (number.bit_length() + 7) // 8
-    data = number.to_bytes(size, "big")
-
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+    data = number.to_bytes((number.bit_length() + 7) // 8, 'big')
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
 
 
-# Changes our RSA public key into JWK format
 def make_jwk(key):
-    public_key = key["private_key"].public_key()
-    numbers = public_key.public_numbers()
-
+    numbers = key['private_key'].public_key().public_numbers()
     return {
-        "kty": "RSA",
-        "kid": key["kid"],
-        "use": "sig",
-        "alg": "RS256",
-        "n": to_base64(numbers.n),
-        "e": to_base64(numbers.e)
+        'kty': 'RSA', 'kid': key['kid'], 'use': 'sig', 'alg': 'RS256',
+        'n': to_base64(numbers.n), 'e': to_base64(numbers.e),
     }
 
 
-# JWKS endpoint
-@app.route("/.well-known/jwks.json", methods=["GET"])
+@app.get('/.well-known/jwks.json')
 def get_jwks():
-    keys = []
     now = int(time.time())
-
-    # Only add keys that are still valid
-    if normal_key["expires"] > now:
-        keys.append(make_jwk(normal_key))
-
-    if old_key["expires"] > now:
-        keys.append(make_jwk(old_key))
-
-    return jsonify({"keys": keys})
+    with connect_db() as connection:
+        rows = connection.execute('SELECT kid, key, exp FROM keys WHERE exp > ?', (now,)).fetchall()
+    keys = [make_jwk({'kid': str(kid), 'private_key': serialization.load_pem_private_key(pem, password=None)})
+            for kid, pem, _ in rows]
+    return jsonify({'keys': keys})
 
 
-# Authentication endpoint
-@app.route("/auth", methods=["POST"])
+@app.post('/auth')
 def auth():
+    expired = 'expired' in request.args
+    key = read_key(expired=expired)
+    if key is None:
+        return jsonify({'error': 'No matching signing key available'}), 503
     now = int(time.time())
-
-    # Use the expired key when ?expired is in the URL
-    if "expired" in request.args:
-        key = old_key
-        expiration = now - 3600
-    else:
-        key = normal_key
-        expiration = now + 3600
-
-    payload = {
-        "sub": "user",
-        "iat": now,
-        "exp": expiration
-    }
-
+    expiration = min(key['exp'], now - 1) if expired else min(key['exp'], now + 3600)
     token = jwt.encode(
-        payload,
-        key["private_key"],
-        algorithm="RS256",
-        headers={"kid": key["kid"]}
+        {'sub': 'user', 'iat': now, 'exp': expiration},
+        key['private_key'], algorithm='RS256', headers={'kid': key['kid']},
     )
-
     return token, 200
 
 
-if __name__ == "__main__":
+initialize_db()
+
+if __name__ == '__main__':
     app.run(port=8080)

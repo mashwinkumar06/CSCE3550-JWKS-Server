@@ -1,88 +1,73 @@
+"""Tests for SQLite-backed JWKS authentication."""
+import sqlite3
 import time
+
 import jwt
+import pytest
+import app as server
 
-from app import app, normal_key, old_key
+
+@pytest.fixture(autouse=True)
+def temporary_database(tmp_path, monkeypatch):
+    monkeypatch.setitem(server.app.config, 'DATABASE', str(tmp_path / 'test.db'))
+    server.initialize_db()
 
 
-def test_jwks():
-    client = app.test_client()
+def test_database_schema_and_key_persistence():
+    with server.connect_db() as connection:
+        rows = connection.execute('SELECT kid, key, exp FROM keys').fetchall()
+    assert len(rows) == 2
+    assert all(isinstance(row[0], int) and b'PRIVATE KEY' in row[1] for row in rows)
+    server.initialize_db()
+    with server.connect_db() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM keys').fetchone()[0] == 2
 
-    response = client.get("/.well-known/jwks.json")
 
+def test_jwks_only_valid_keys():
+    response = server.app.test_client().get('/.well-known/jwks.json')
     assert response.status_code == 200
-
-    data = response.get_json()
-
-    assert "keys" in data
-    assert len(data["keys"]) == 1
-
-    key = data["keys"][0]
-
-    assert key["kid"] == normal_key["kid"]
-    assert key["kty"] == "RSA"
-    assert key["alg"] == "RS256"
-
-    # The expired key should not be in JWKS
-    assert key["kid"] != old_key["kid"]
+    keys = response.get_json()['keys']
+    assert len(keys) == 1
+    assert keys[0]['kty'] == 'RSA'
+    assert keys[0]['alg'] == 'RS256'
+    assert keys[0]['use'] == 'sig'
+    assert keys[0]['n'] and keys[0]['e']
+    assert keys[0]['kid'] == server.read_key()['kid']
 
 
-def test_normal_auth():
-    client = app.test_client()
-
-    response = client.post("/auth")
-
+@pytest.mark.parametrize('endpoint,expired', [('/auth', False), ('/auth?expired=true', True), ('/auth?expired', True)])
+def test_auth_tokens(endpoint, expired):
+    response = server.app.test_client().post(endpoint, json={'username': 'userABC', 'password': 'password123'})
     assert response.status_code == 200
-
     token = response.get_data(as_text=True)
-
-    header = jwt.get_unverified_header(token)
-
-    assert header["kid"] == normal_key["kid"]
-
-    payload = jwt.decode(
-        token,
-        normal_key["private_key"].public_key(),
-        algorithms=["RS256"]
-    )
-
-    assert payload["sub"] == "user"
-    assert payload["exp"] > int(time.time())
+    key = server.read_key(expired=expired)
+    assert jwt.get_unverified_header(token)['kid'] == key['kid']
+    payload = jwt.decode(token, key['private_key'].public_key(), algorithms=['RS256'], options={'verify_exp': False})
+    assert payload['sub'] == 'user'
+    assert (payload['exp'] <= int(time.time())) == expired
 
 
-def test_expired_auth():
-    client = app.test_client()
-
-    response = client.post("/auth?expired=true")
-
-    assert response.status_code == 200
-
-    token = response.get_data(as_text=True)
-
-    header = jwt.get_unverified_header(token)
-
-    assert header["kid"] == old_key["kid"]
-
-    payload = jwt.decode(
-        token,
-        old_key["private_key"].public_key(),
-        algorithms=["RS256"],
-        options={"verify_exp": False}
-    )
-
-    assert payload["exp"] < int(time.time())
+def test_missing_key_returns_503():
+    with server.connect_db() as connection:
+        connection.execute('DELETE FROM keys')
+    response = server.app.test_client().post('/auth')
+    assert response.status_code == 503
 
 
-def test_auth_get_not_allowed():
-    client = app.test_client()
-
-    response = client.get("/auth")
-
-    assert response.status_code == 405
+def test_http_methods():
+    client = server.app.test_client()
+    assert client.get('/auth').status_code == 405
+    assert client.post('/.well-known/jwks.json').status_code == 405
 
 
-def test_jwks_post_not_allowed():
-    client = app.test_client()
+def test_generate_key():
+    kid = server.generate_key(int(time.time()) + 7200)
+    assert isinstance(kid, int)
+    with server.connect_db() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM keys WHERE kid = ?', (kid,)).fetchone()[0] == 1
 
-    response = client.post("/.well-known/jwks.json")
 
-    assert response.status_code == 405
+def test_expired_key_is_not_published():
+    with server.connect_db() as connection:
+        connection.execute('UPDATE keys SET exp = ?', (int(time.time()) - 5,))
+    assert server.app.test_client().get('/.well-known/jwks.json').get_json() == {'keys': []}
